@@ -1,5 +1,5 @@
 /*
- * ElDinWM - Fixed version with proper NULL checks
+ * ElDinWM - Array-based version (no linked list iterations)
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -33,23 +33,24 @@
 #include <xkbcommon/xkbcommon.h>
 
 #define MAX_WORKSPACES 16
+#define MAX_VIEWS 64
+#define MAX_OUTPUTS 8
+#define MAX_KEYBOARDS 8
 #define VIEWS_PER_WS 2
 #define MAX_CMD_LEN 512
-
-struct config {
-    int num_workspaces;
-};
 
 struct server;
 struct output;
 struct view;
 
+/* Simple command box */
 struct cmdbox {
     bool active;
     char text[MAX_CMD_LEN];
     int len;
 };
 
+/* Server with arrays instead of lists */
 struct server {
     struct wl_display *display;
     struct wlr_backend *backend;
@@ -74,17 +75,22 @@ struct server {
     struct wl_listener request_cursor;
     struct wl_listener request_set_selection;
     
-    struct wl_list outputs;
-    struct wl_list views;
-    struct wl_list keyboards;
+    struct output *outputs[MAX_OUTPUTS];
+    int output_count;
     
-    struct config config;
+    struct view *views[MAX_VIEWS];
+    int view_count;
+    
+    struct keyboard *keyboards[MAX_KEYBOARDS];
+    int keyboard_count;
+    
+    int num_workspaces;
     struct cmdbox cmdbox;
     bool running;
 };
 
+/* Output */
 struct output {
-    struct wl_list link;
     struct server *server;
     struct wlr_output *wlr_output;
     struct wlr_scene_output *scene_output;
@@ -92,12 +98,11 @@ struct output {
     struct wl_listener destroy;
     
     int current_ws;
-    struct wl_list workspaces[MAX_WORKSPACES];
+    struct view *workspaces[MAX_WORKSPACES][VIEWS_PER_WS];
 };
 
+/* View */
 struct view {
-    struct wl_list link;
-    struct wl_list ws_link;
     struct server *server;
     struct wlr_xdg_toplevel *xdg_toplevel;
     struct wlr_scene_tree *scene_tree;
@@ -105,104 +110,93 @@ struct view {
     struct wl_listener map;
     struct wl_listener unmap;
     struct wl_listener destroy;
-    struct wl_listener request_fullscreen;
     
     struct output *output;
     int workspace;
+    int ws_slot;
     bool mapped;
 };
 
+/* Keyboard */
 struct keyboard {
-    struct wl_list link;
     struct server *server;
     struct wlr_keyboard *wlr_keyboard;
     struct wl_listener modifiers;
     struct wl_listener key;
-    struct wl_listener destroy;
 };
 
 static struct server g_server = {0};
 
-static int count_workspace_views(struct output *output, int ws) {
-    if (!output || ws < 0 || ws >= MAX_WORKSPACES) return 0;
-    
-    int count = 0;
-    struct view *v;
-    wl_list_for_each(v, &output->workspaces[ws], ws_link) {
-        count++;
+/* Find space in workspaces */
+static bool find_space(struct server *s, struct output **out_output, int *out_ws, int *out_slot) {
+    for (int i = 0; i < s->output_count; i++) {
+        struct output *o = s->outputs[i];
+        if (!o) continue;
+        
+        for (int ws = 0; ws < s->num_workspaces; ws++) {
+            for (int slot = 0; slot < VIEWS_PER_WS; slot++) {
+                if (o->workspaces[ws][slot] == NULL) {
+                    *out_output = o;
+                    *out_ws = ws;
+                    *out_slot = slot;
+                    return true;
+                }
+            }
+        }
     }
-    return count;
+    return false;
 }
 
+/* Layout workspace */
 static void layout_workspace(struct output *output) {
-    if (!output || !output->wlr_output) {
-        fprintf(stderr, "[LAYOUT] NULL output, skipping\n");
-        return;
-    }
-    
-    fprintf(stderr, "[LAYOUT] Starting layout for workspace %d\n", output->current_ws);
+    if (!output || !output->wlr_output) return;
     
     int width = output->wlr_output->width;
     int height = output->wlr_output->height;
+    int ws = output->current_ws;
     
-    /* Hide all views */
-    struct view *view;
-    wl_list_for_each(view, &output->server->views, link) {
-        if (view->mapped && view->scene_tree) {
-            wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+    fprintf(stderr, "[LAYOUT] Workspace %d\n", ws + 1);
+    
+    /* Hide all views first */
+    for (int i = 0; i < output->server->view_count; i++) {
+        struct view *v = output->server->views[i];
+        if (v && v->mapped && v->scene_tree) {
+            wlr_scene_node_set_enabled(&v->scene_tree->node, false);
         }
     }
     
-    /* Collect current workspace views */
+    /* Count views in current workspace */
     int count = 0;
-    struct view *views[2] = {NULL, NULL};
-    wl_list_for_each(view, &output->workspaces[output->current_ws], ws_link) {
-        if (count < 2 && view->mapped) {
-            views[count++] = view;
+    struct view *visible[2] = {NULL, NULL};
+    
+    for (int slot = 0; slot < VIEWS_PER_WS; slot++) {
+        struct view *v = output->workspaces[ws][slot];
+        if (v && v->mapped) {
+            visible[count++] = v;
         }
     }
     
-    fprintf(stderr, "[LAYOUT] Found %d views in workspace %d\n", count, output->current_ws);
+    fprintf(stderr, "[LAYOUT] %d visible views\n", count);
     
-    /* Layout based on count */
-    if (count == 1 && views[0] && views[0]->scene_tree) {
-        wlr_scene_node_set_enabled(&views[0]->scene_tree->node, true);
-        wlr_scene_node_set_position(&views[0]->scene_tree->node, 0, 0);
-        wlr_xdg_toplevel_set_size(views[0]->xdg_toplevel, width, height);
-        fprintf(stderr, "[LAYOUT] Single window: fullscreen\n");
+    /* Layout */
+    if (count == 1 && visible[0]) {
+        wlr_scene_node_set_enabled(&visible[0]->scene_tree->node, true);
+        wlr_scene_node_set_position(&visible[0]->scene_tree->node, 0, 0);
+        wlr_xdg_toplevel_set_size(visible[0]->xdg_toplevel, width, height);
     } else if (count == 2) {
         int half = width / 2;
         for (int i = 0; i < 2; i++) {
-            if (views[i] && views[i]->scene_tree) {
-                wlr_scene_node_set_enabled(&views[i]->scene_tree->node, true);
-                wlr_scene_node_set_position(&views[i]->scene_tree->node, i * half, 0);
-                wlr_xdg_toplevel_set_size(views[i]->xdg_toplevel, half, height);
-            }
-        }
-        fprintf(stderr, "[LAYOUT] Two windows: 50/50 split\n");
-    }
-    
-    fprintf(stderr, "[LAYOUT] Layout complete\n");
-}
-
-static struct output *find_space(struct server *server, int *out_ws) {
-    if (!server) return NULL;
-    
-    struct output *output;
-    wl_list_for_each(output, &server->outputs, link) {
-        for (int i = 0; i < server->config.num_workspaces; i++) {
-            if (count_workspace_views(output, i) < VIEWS_PER_WS) {
-                *out_ws = i;
-                return output;
+            if (visible[i]) {
+                wlr_scene_node_set_enabled(&visible[i]->scene_tree->node, true);
+                wlr_scene_node_set_position(&visible[i]->scene_tree->node, i * half, 0);
+                wlr_xdg_toplevel_set_size(visible[i]->xdg_toplevel, half, height);
             }
         }
     }
-    return NULL;
 }
 
 static void exec_command(const char *cmd) {
     if (!cmd || !cmd[0]) return;
-    
     if (fork() == 0) {
         setsid();
         execl("/bin/sh", "/bin/sh", "-lc", cmd, NULL);
@@ -210,74 +204,57 @@ static void exec_command(const char *cmd) {
     }
 }
 
-static void cycle_focus(struct server *server) {
-    if (!server) return;
+static void cycle_focus(struct server *s) {
+    fprintf(stderr, "[FOCUS] Cycling\n");
     
-    fprintf(stderr, "[FOCUS] Attempting to cycle focus\n");
-    
-    struct output *output;
-    wl_list_for_each(output, &server->outputs, link) {
-        struct view *views[2] = {NULL, NULL};
-        int count = 0;
+    for (int i = 0; i < s->output_count; i++) {
+        struct output *o = s->outputs[i];
+        if (!o) continue;
         
-        struct view *v;
-        wl_list_for_each(v, &output->workspaces[output->current_ws], ws_link) {
-            if (count < 2 && v->mapped) {
-                views[count++] = v;
-            }
-        }
+        int ws = o->current_ws;
+        struct view *v0 = o->workspaces[ws][0];
+        struct view *v1 = o->workspaces[ws][1];
         
-        if (count == 2 && views[0] && views[1]) {
-            struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
-            struct view *other = NULL;
+        if (v0 && v1 && v0->mapped && v1->mapped) {
+            struct wlr_surface *focused = s->seat->keyboard_state.focused_surface;
+            struct view *other = (v0->xdg_toplevel->base->surface == focused) ? v1 : v0;
             
-            if (views[0]->xdg_toplevel && views[0]->xdg_toplevel->base->surface == focused) {
-                other = views[1];
-            } else {
-                other = views[0];
-            }
-            
-            if (other && other->xdg_toplevel && other->xdg_toplevel->base) {
-                wlr_seat_keyboard_notify_enter(server->seat,
-                    other->xdg_toplevel->base->surface, NULL, 0, NULL);
-                fprintf(stderr, "[FOCUS] Cycled to other window\n");
-            }
+            wlr_seat_keyboard_notify_enter(s->seat, other->xdg_toplevel->base->surface, NULL, 0, NULL);
+            fprintf(stderr, "[FOCUS] Cycled\n");
         }
     }
 }
 
-static void handle_key(struct server *server, xkb_keysym_t sym, uint32_t mods) {
-    if (!server) return;
-    
+static void handle_key(struct server *s, xkb_keysym_t sym, uint32_t mods) {
     uint32_t ctrl_shift = WLR_MODIFIER_CTRL | WLR_MODIFIER_SHIFT;
     
     /* Command box mode */
-    if (server->cmdbox.active) {
-        fprintf(stderr, "[CMDBOX] Key in command box: sym=%d\n", sym);
+    if (s->cmdbox.active) {
+        fprintf(stderr, "[CMDBOX] Key: %d\n", sym);
         
         if (sym == XKB_KEY_Escape) {
-            server->cmdbox.active = false;
-            server->cmdbox.len = 0;
-            server->cmdbox.text[0] = '\0';
+            s->cmdbox.active = false;
+            s->cmdbox.len = 0;
+            s->cmdbox.text[0] = '\0';
             fprintf(stderr, "[CMDBOX] Closed\n");
-        } else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
-            if (server->cmdbox.len > 0) {
-                fprintf(stderr, "[CMDBOX] Executing: %s\n", server->cmdbox.text);
-                exec_command(server->cmdbox.text);
+        } else if (sym == XKB_KEY_Return) {
+            if (s->cmdbox.len > 0) {
+                fprintf(stderr, "[CMDBOX] Exec: %s\n", s->cmdbox.text);
+                exec_command(s->cmdbox.text);
             }
-            server->cmdbox.active = false;
-            server->cmdbox.len = 0;
-            server->cmdbox.text[0] = '\0';
+            s->cmdbox.active = false;
+            s->cmdbox.len = 0;
+            s->cmdbox.text[0] = '\0';
         } else if (sym == XKB_KEY_BackSpace) {
-            if (server->cmdbox.len > 0) {
-                server->cmdbox.len--;
-                server->cmdbox.text[server->cmdbox.len] = '\0';
-                fprintf(stderr, "[CMDBOX] Text: %s\n", server->cmdbox.text);
+            if (s->cmdbox.len > 0) {
+                s->cmdbox.len--;
+                s->cmdbox.text[s->cmdbox.len] = '\0';
+                fprintf(stderr, "[CMDBOX] %s\n", s->cmdbox.text);
             }
-        } else if (sym >= 32 && sym < 127 && server->cmdbox.len < MAX_CMD_LEN - 1) {
-            server->cmdbox.text[server->cmdbox.len++] = (char)sym;
-            server->cmdbox.text[server->cmdbox.len] = '\0';
-            fprintf(stderr, "[CMDBOX] Text: %s\n", server->cmdbox.text);
+        } else if (sym >= 32 && sym < 127 && s->cmdbox.len < MAX_CMD_LEN - 1) {
+            s->cmdbox.text[s->cmdbox.len++] = (char)sym;
+            s->cmdbox.text[s->cmdbox.len] = '\0';
+            fprintf(stderr, "[CMDBOX] %s\n", s->cmdbox.text);
         }
         return;
     }
@@ -287,73 +264,68 @@ static void handle_key(struct server *server, xkb_keysym_t sym, uint32_t mods) {
     
     switch (sym) {
         case XKB_KEY_Down:
-            fprintf(stderr, "[EXIT] Exiting ElDinWM\n");
-            wl_display_terminate(server->display);
-            server->running = false;
+            fprintf(stderr, "[EXIT] Bye\n");
+            wl_display_terminate(s->display);
+            s->running = false;
             break;
             
         case XKB_KEY_Left:
         case XKB_KEY_Right: {
-            fprintf(stderr, "[WORKSPACE] Attempting to switch workspace\n");
+            fprintf(stderr, "[WORKSPACE] Switch attempt (outputs: %d)\n", s->output_count);
             
             int delta = (sym == XKB_KEY_Right) ? 1 : -1;
-            struct output *output;
             
-            int output_count = 0;
-            wl_list_for_each(output, &server->outputs, link) {
-                output_count++;
-                
-                if (!output || !output->wlr_output) {
-                    fprintf(stderr, "[WORKSPACE] Invalid output, skipping\n");
+            for (int i = 0; i < s->output_count; i++) {
+                struct output *o = s->outputs[i];
+                if (!o) {
+                    fprintf(stderr, "[WORKSPACE] Output %d is NULL\n", i);
                     continue;
                 }
                 
-                int new_ws = output->current_ws + delta;
-                fprintf(stderr, "[WORKSPACE] Current: %d, New: %d, Max: %d\n", 
-                    output->current_ws, new_ws, server->config.num_workspaces);
+                int new_ws = o->current_ws + delta;
+                fprintf(stderr, "[WORKSPACE] Output %d: %d -> %d\n", i, o->current_ws, new_ws);
                 
-                if (new_ws >= 0 && new_ws < server->config.num_workspaces) {
-                    output->current_ws = new_ws;
-                    fprintf(stderr, "[WORKSPACE] Switched to workspace %d\n", new_ws + 1);
-                    layout_workspace(output);
+                if (new_ws >= 0 && new_ws < s->num_workspaces) {
+                    o->current_ws = new_ws;
+                    fprintf(stderr, "[WORKSPACE] Switched to %d, calling layout\n", new_ws + 1);
+                    layout_workspace(o);
+                    fprintf(stderr, "[WORKSPACE] Layout done\n");
                 } else {
-                    fprintf(stderr, "[WORKSPACE] Out of bounds, staying at %d\n", output->current_ws);
+                    fprintf(stderr, "[WORKSPACE] Out of bounds\n");
                 }
             }
             
-            fprintf(stderr, "[WORKSPACE] Processed %d outputs\n", output_count);
+            fprintf(stderr, "[WORKSPACE] Switch complete\n");
             break;
         }
         
         case XKB_KEY_z:
         case XKB_KEY_Z:
-            fprintf(stderr, "[CMDBOX] Opening command box\n");
-            server->cmdbox.active = true;
-            server->cmdbox.len = 0;
-            server->cmdbox.text[0] = '\0';
-            fprintf(stderr, "[CMDBOX] Ready for input (type and press Enter)\n");
+            fprintf(stderr, "[CMDBOX] Opening\n");
+            s->cmdbox.active = true;
+            s->cmdbox.len = 0;
+            s->cmdbox.text[0] = '\0';
+            fprintf(stderr, "[CMDBOX] Ready\n");
             break;
             
         case XKB_KEY_x:
         case XKB_KEY_X:
-            cycle_focus(server);
+            cycle_focus(s);
             break;
     }
+    
+    fprintf(stderr, "[KEY] Handler done\n");
 }
 
 static void kb_modifiers(struct wl_listener *listener, void *data) {
     struct keyboard *kb = wl_container_of(listener, kb, modifiers);
-    if (kb && kb->server && kb->server->seat && kb->wlr_keyboard) {
-        wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
-        wlr_seat_keyboard_notify_modifiers(kb->server->seat, &kb->wlr_keyboard->modifiers);
-    }
+    wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
+    wlr_seat_keyboard_notify_modifiers(kb->server->seat, &kb->wlr_keyboard->modifiers);
 }
 
 static void kb_key(struct wl_listener *listener, void *data) {
     struct keyboard *kb = wl_container_of(listener, kb, key);
     struct wlr_keyboard_key_event *event = data;
-    
-    if (!kb || !kb->server || !kb->wlr_keyboard) return;
     
     if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         const xkb_keysym_t *syms;
@@ -371,19 +343,12 @@ static void kb_key(struct wl_listener *listener, void *data) {
         event->keycode, event->state);
 }
 
-static void kb_destroy(struct wl_listener *listener, void *data) {
-    struct keyboard *kb = wl_container_of(listener, kb, destroy);
-    wl_list_remove(&kb->modifiers.link);
-    wl_list_remove(&kb->key.link);
-    wl_list_remove(&kb->destroy.link);
-    wl_list_remove(&kb->link);
-    free(kb);
-}
-
-static void new_keyboard(struct server *server, struct wlr_input_device *device) {
+static void new_keyboard(struct server *s, struct wlr_input_device *device) {
+    if (s->keyboard_count >= MAX_KEYBOARDS) return;
+    
     struct wlr_keyboard *wlr_kb = wlr_keyboard_from_input_device(device);
     struct keyboard *kb = calloc(1, sizeof(*kb));
-    kb->server = server;
+    kb->server = s;
     kb->wlr_keyboard = wlr_kb;
     
     struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
@@ -397,186 +362,150 @@ static void new_keyboard(struct server *server, struct wlr_input_device *device)
     wl_signal_add(&wlr_kb->events.modifiers, &kb->modifiers);
     kb->key.notify = kb_key;
     wl_signal_add(&wlr_kb->events.key, &kb->key);
-    kb->destroy.notify = kb_destroy;
-    wl_signal_add(&device->events.destroy, &kb->destroy);
     
-    wlr_seat_set_keyboard(server->seat, wlr_kb);
-    wl_list_insert(&server->keyboards, &kb->link);
+    wlr_seat_set_keyboard(s->seat, wlr_kb);
+    s->keyboards[s->keyboard_count++] = kb;
     
-    fprintf(stderr, "[INPUT] Keyboard added\n");
+    fprintf(stderr, "[INPUT] Keyboard added (%d total)\n", s->keyboard_count);
 }
 
-static void process_cursor_motion(struct server *server, uint32_t time) {
-    if (server && server->seat) {
-        wlr_seat_pointer_notify_motion(server->seat, time,
-            server->cursor->x, server->cursor->y);
-    }
+static void process_cursor_motion(struct server *s, uint32_t time) {
+    wlr_seat_pointer_notify_motion(s->seat, time, s->cursor->x, s->cursor->y);
 }
 
 static void cursor_motion(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, cursor_motion);
+    struct server *s = wl_container_of(listener, s, cursor_motion);
     struct wlr_pointer_motion_event *event = data;
-    if (server && server->cursor) {
-        wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x, event->delta_y);
-        process_cursor_motion(server, event->time_msec);
-    }
+    wlr_cursor_move(s->cursor, &event->pointer->base, event->delta_x, event->delta_y);
+    process_cursor_motion(s, event->time_msec);
 }
 
 static void cursor_motion_absolute(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, cursor_motion_absolute);
+    struct server *s = wl_container_of(listener, s, cursor_motion_absolute);
     struct wlr_pointer_motion_absolute_event *event = data;
-    if (server && server->cursor) {
-        wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x, event->y);
-        process_cursor_motion(server, event->time_msec);
-    }
+    wlr_cursor_warp_absolute(s->cursor, &event->pointer->base, event->x, event->y);
+    process_cursor_motion(s, event->time_msec);
 }
 
 static void cursor_button(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, cursor_button);
+    struct server *s = wl_container_of(listener, s, cursor_button);
     struct wlr_pointer_button_event *event = data;
-    if (server && server->seat) {
-        wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-            event->button, event->state);
-    }
+    wlr_seat_pointer_notify_button(s->seat, event->time_msec, event->button, event->state);
 }
 
 static void cursor_axis(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, cursor_axis);
+    struct server *s = wl_container_of(listener, s, cursor_axis);
     struct wlr_pointer_axis_event *event = data;
-    if (server && server->seat) {
-        wlr_seat_pointer_notify_axis(server->seat, event->time_msec,
-            event->orientation, event->delta, event->delta_discrete, event->source,
-            event->relative_direction);
-    }
+    wlr_seat_pointer_notify_axis(s->seat, event->time_msec,
+        event->orientation, event->delta, event->delta_discrete, event->source,
+        event->relative_direction);
 }
 
 static void cursor_frame(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, cursor_frame);
-    if (server && server->seat) {
-        wlr_seat_pointer_notify_frame(server->seat);
-    }
+    struct server *s = wl_container_of(listener, s, cursor_frame);
+    wlr_seat_pointer_notify_frame(s->seat);
 }
 
 static void request_cursor(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, request_cursor);
+    struct server *s = wl_container_of(listener, s, request_cursor);
     struct wlr_seat_pointer_request_set_cursor_event *event = data;
-    if (server && server->seat && server->cursor &&
-        server->seat->pointer_state.focused_client == event->seat_client) {
-        wlr_cursor_set_surface(server->cursor, event->surface,
-            event->hotspot_x, event->hotspot_y);
+    if (s->seat->pointer_state.focused_client == event->seat_client) {
+        wlr_cursor_set_surface(s->cursor, event->surface, event->hotspot_x, event->hotspot_y);
     }
 }
 
 static void request_set_selection(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, request_set_selection);
+    struct server *s = wl_container_of(listener, s, request_set_selection);
     struct wlr_seat_request_set_selection_event *event = data;
-    if (server && server->seat) {
-        wlr_seat_set_selection(server->seat, event->source, event->serial);
-    }
+    wlr_seat_set_selection(s->seat, event->source, event->serial);
 }
 
-static void new_pointer(struct server *server, struct wlr_input_device *device) {
-    if (server && server->cursor) {
-        wlr_cursor_attach_input_device(server->cursor, device);
-        fprintf(stderr, "[INPUT] Pointer added\n");
-    }
+static void new_pointer(struct server *s, struct wlr_input_device *device) {
+    wlr_cursor_attach_input_device(s->cursor, device);
 }
 
 static void new_input(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, new_input);
+    struct server *s = wl_container_of(listener, s, new_input);
     struct wlr_input_device *device = data;
-    
-    if (!server || !device) return;
     
     switch (device->type) {
         case WLR_INPUT_DEVICE_KEYBOARD:
-            new_keyboard(server, device);
+            new_keyboard(s, device);
             break;
         case WLR_INPUT_DEVICE_POINTER:
-            new_pointer(server, device);
+            new_pointer(s, device);
             break;
         default:
             break;
     }
     
-    uint32_t caps = WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD;
-    wlr_seat_set_capabilities(server->seat, caps);
+    wlr_seat_set_capabilities(s->seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
 }
 
 static void view_map(struct wl_listener *listener, void *data) {
     struct view *view = wl_container_of(listener, view, map);
-    if (!view || !view->server) return;
-    
     view->mapped = true;
     
-    int ws;
-    struct output *output = find_space(view->server, &ws);
+    struct output *output;
+    int ws, slot;
     
-    if (output) {
+    if (find_space(view->server, &output, &ws, &slot)) {
         view->output = output;
         view->workspace = ws;
-        wl_list_insert(&output->workspaces[ws], &view->ws_link);
+        view->ws_slot = slot;
+        output->workspaces[ws][slot] = view;
+        
         layout_workspace(output);
+        wlr_seat_keyboard_notify_enter(view->server->seat,
+            view->xdg_toplevel->base->surface, NULL, 0, NULL);
         
-        if (view->xdg_toplevel && view->xdg_toplevel->base && view->server->seat) {
-            wlr_seat_keyboard_notify_enter(view->server->seat,
-                view->xdg_toplevel->base->surface, NULL, 0, NULL);
-        }
-        
-        fprintf(stderr, "[VIEW] Mapped to workspace %d/%d\n", ws + 1, 
-            view->server->config.num_workspaces);
+        fprintf(stderr, "[VIEW] Mapped to WS %d slot %d\n", ws + 1, slot);
     } else {
-        if (view->scene_tree) {
-            wlr_scene_node_set_enabled(&view->scene_tree->node, false);
-        }
+        wlr_scene_node_set_enabled(&view->scene_tree->node, false);
         fprintf(stderr, "[VIEW] All workspaces full\n");
     }
 }
 
 static void view_unmap(struct wl_listener *listener, void *data) {
     struct view *view = wl_container_of(listener, view, unmap);
-    if (!view) return;
-    
     view->mapped = false;
     
     if (view->output) {
-        wl_list_remove(&view->ws_link);
-        wl_list_init(&view->ws_link);
+        view->output->workspaces[view->workspace][view->ws_slot] = NULL;
         layout_workspace(view->output);
         view->output = NULL;
-        fprintf(stderr, "[VIEW] Unmapped\n");
     }
 }
 
 static void view_destroy(struct wl_listener *listener, void *data) {
     struct view *view = wl_container_of(listener, view, destroy);
+    
     wl_list_remove(&view->map.link);
     wl_list_remove(&view->unmap.link);
     wl_list_remove(&view->destroy.link);
-    wl_list_remove(&view->request_fullscreen.link);
-    wl_list_remove(&view->link);
+    
+    /* Remove from views array */
+    for (int i = 0; i < view->server->view_count; i++) {
+        if (view->server->views[i] == view) {
+            view->server->views[i] = NULL;
+            break;
+        }
+    }
+    
     free(view);
 }
 
-static void view_request_fullscreen(struct wl_listener *listener, void *data) {
-    struct view *view = wl_container_of(listener, view, request_fullscreen);
-    if (view && view->xdg_toplevel) {
-        wlr_xdg_toplevel_set_fullscreen(view->xdg_toplevel, false);
-    }
-}
-
 static void new_xdg_surface(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, new_xdg_surface);
+    struct server *s = wl_container_of(listener, s, new_xdg_surface);
     struct wlr_xdg_surface *xdg_surface = data;
     
-    if (!server || !xdg_surface) return;
     if (xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) return;
+    if (s->view_count >= MAX_VIEWS) return;
     
     struct view *view = calloc(1, sizeof(*view));
-    view->server = server;
+    view->server = s;
     view->xdg_toplevel = xdg_surface->toplevel;
-    view->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree, xdg_surface);
-    wl_list_init(&view->ws_link);
+    view->scene_tree = wlr_scene_xdg_surface_create(&s->scene->tree, xdg_surface);
     
     view->map.notify = view_map;
     wl_signal_add(&xdg_surface->surface->events.map, &view->map);
@@ -584,43 +513,45 @@ static void new_xdg_surface(struct wl_listener *listener, void *data) {
     wl_signal_add(&xdg_surface->surface->events.unmap, &view->unmap);
     view->destroy.notify = view_destroy;
     wl_signal_add(&xdg_surface->events.destroy, &view->destroy);
-    view->request_fullscreen.notify = view_request_fullscreen;
-    wl_signal_add(&xdg_surface->toplevel->events.request_fullscreen, &view->request_fullscreen);
     
-    wl_list_insert(&server->views, &view->link);
+    s->views[s->view_count++] = view;
 }
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct output *output = wl_container_of(listener, output, frame);
-    if (!output || !output->server || !output->server->scene || !output->wlr_output) return;
-    
     struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
         output->server->scene, output->wlr_output);
     
-    if (scene_output) {
-        wlr_scene_output_commit(scene_output, NULL);
-        
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-    }
+    wlr_scene_output_commit(scene_output, NULL);
+    
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    wlr_scene_output_send_frame_done(scene_output, &now);
 }
 
 static void output_destroy(struct wl_listener *listener, void *data) {
     struct output *output = wl_container_of(listener, output, destroy);
     wl_list_remove(&output->frame.link);
     wl_list_remove(&output->destroy.link);
-    wl_list_remove(&output->link);
+    
+    /* Remove from array */
+    for (int i = 0; i < output->server->output_count; i++) {
+        if (output->server->outputs[i] == output) {
+            output->server->outputs[i] = NULL;
+            break;
+        }
+    }
+    
     free(output);
 }
 
 static void new_output(struct wl_listener *listener, void *data) {
-    struct server *server = wl_container_of(listener, server, new_output);
+    struct server *s = wl_container_of(listener, s, new_output);
     struct wlr_output *wlr_output = data;
     
-    if (!server || !wlr_output) return;
+    if (s->output_count >= MAX_OUTPUTS) return;
     
-    wlr_output_init_render(wlr_output, server->allocator, server->renderer);
+    wlr_output_init_render(wlr_output, s->allocator, s->renderer);
     
     struct wlr_output_state state;
     wlr_output_state_init(&state);
@@ -633,13 +564,15 @@ static void new_output(struct wl_listener *listener, void *data) {
     wlr_output_state_finish(&state);
     
     struct output *output = calloc(1, sizeof(*output));
-    output->server = server;
+    output->server = s;
     output->wlr_output = wlr_output;
     output->current_ws = 0;
     
-    /* Initialize ALL workspace lists */
+    /* Initialize workspace array to NULL */
     for (int i = 0; i < MAX_WORKSPACES; i++) {
-        wl_list_init(&output->workspaces[i]);
+        for (int j = 0; j < VIEWS_PER_WS; j++) {
+            output->workspaces[i][j] = NULL;
+        }
     }
     
     output->frame.notify = output_frame;
@@ -647,89 +580,15 @@ static void new_output(struct wl_listener *listener, void *data) {
     output->destroy.notify = output_destroy;
     wl_signal_add(&wlr_output->events.destroy, &output->destroy);
     
-    wlr_output_layout_add_auto(server->output_layout, wlr_output);
-    output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
+    wlr_output_layout_add_auto(s->output_layout, wlr_output);
+    output->scene_output = wlr_scene_output_create(s->scene, wlr_output);
     
-    wl_list_insert(&server->outputs, &output->link);
-    fprintf(stderr, "[OUTPUT] %s (%dx%d) with %d workspaces\n", 
-        wlr_output->name, wlr_output->width, wlr_output->height,
-        server->config.num_workspaces);
-}
-
-static void get_config_path(char *path, size_t size) {
-    const char *xdg = getenv("XDG_CONFIG_HOME");
-    if (xdg) {
-        snprintf(path, size, "%s/eldinwm/eldinwm.conf", xdg);
-        if (access(path, F_OK) == 0) return;
-    }
+    s->outputs[s->output_count++] = output;
     
-    const char *home = getenv("HOME");
-    if (!home) {
-        struct passwd *pw = getpwuid(getuid());
-        home = pw ? pw->pw_dir : "/tmp";
-    }
-    
-    snprintf(path, size, "%s/.config/eldinwm/eldinwm.conf", home);
-    if (access(path, F_OK) == 0) return;
-    
-    snprintf(path, size, "/etc/eldinwm/eldinwm.conf");
-}
-
-static void trim(char *str) {
-    if (!str) return;
-    char *start = str;
-    while (isspace(*start)) start++;
-    char *end = start + strlen(start) - 1;
-    while (end > start && isspace(*end)) end--;
-    *(end + 1) = '\0';
-    if (start != str) memmove(str, start, strlen(start) + 1);
-}
-
-static void parse_config(struct config *cfg, const char *path) {
-    cfg->num_workspaces = 4;
-    
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[CONFIG] Using defaults: 4 workspaces\n");
-        return;
-    }
-    
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        char *comment = strchr(line, '#');
-        if (comment) *comment = '\0';
-        trim(line);
-        if (!line[0]) continue;
-        
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        
-        char *key = line;
-        char *val = eq + 1;
-        trim(key);
-        trim(val);
-        
-        if (val[0] == '"') {
-            val++;
-            char *end = strchr(val, '"');
-            if (end) *end = '\0';
-        }
-        
-        if (strcmp(key, "workspaces") == 0) {
-            int ws = atoi(val);
-            if (ws >= 1 && ws <= MAX_WORKSPACES) {
-                cfg->num_workspaces = ws;
-                fprintf(stderr, "[CONFIG] Workspaces: %d\n", ws);
-            }
-        }
-    }
-    
-    fclose(f);
+    fprintf(stderr, "[OUTPUT] %s added (%d total)\n", wlr_output->name, s->output_count);
 }
 
 static void handle_signal(int sig) {
-    fprintf(stderr, "\n[SIGNAL] %d - Terminating\n", sig);
     wl_display_terminate(g_server.display);
 }
 
@@ -737,17 +596,14 @@ int main(void) {
     wlr_log_init(WLR_ERROR, NULL);
     
     struct server *s = &g_server;
-    wl_list_init(&s->outputs);
-    wl_list_init(&s->views);
-    wl_list_init(&s->keyboards);
+    s->num_workspaces = 4;
+    s->output_count = 0;
+    s->view_count = 0;
+    s->keyboard_count = 0;
     
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGCHLD, SIG_IGN);
-    
-    char cfg_path[512];
-    get_config_path(cfg_path, sizeof(cfg_path));
-    parse_config(&s->config, cfg_path);
     
     s->display = wl_display_create();
     s->backend = wlr_backend_autocreate(wl_display_get_event_loop(s->display), NULL);
@@ -763,10 +619,10 @@ int main(void) {
     s->scene_layout = wlr_scene_attach_output_layout(s->scene, s->output_layout);
     
     /* Background */
-    struct wlr_scene_tree *bg_tree = wlr_scene_tree_create(&s->scene->tree);
-    wlr_scene_node_lower_to_bottom(&bg_tree->node);
-    float bg[4] = {0.0, 0.05, 0.15, 1.0};
-    wlr_scene_rect_create(bg_tree, 8192, 8192, bg);
+    struct wlr_scene_tree *bg = wlr_scene_tree_create(&s->scene->tree);
+    wlr_scene_node_lower_to_bottom(&bg->node);
+    float col[4] = {0.0, 0.05, 0.15, 1.0};
+    wlr_scene_rect_create(bg, 8192, 8192, col);
     
     s->xdg_shell = wlr_xdg_shell_create(s->display, 3);
     s->new_xdg_surface.notify = new_xdg_surface;
@@ -808,24 +664,24 @@ int main(void) {
     setenv("WAYLAND_DISPLAY", socket, 1);
     
     fprintf(stderr, "\n");
-    fprintf(stderr, "╔════════════════════════════════════════╗\n");
-    fprintf(stderr, "║           ElDinWM Ready                ║\n");
-    fprintf(stderr, "╚════════════════════════════════════════╝\n");
+    fprintf(stderr, "══════════════════════════════════════\n");
+    fprintf(stderr, "       ElDinWM - Ready                \n");
+    fprintf(stderr, "══════════════════════════════════════\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "WAYLAND_DISPLAY=%s\n", socket);
-    fprintf(stderr, "Workspaces: %d\n", s->config.num_workspaces);
+    fprintf(stderr, "Workspaces: %d\n", s->num_workspaces);
     fprintf(stderr, "\n");
     fprintf(stderr, "KEYS:\n");
-    fprintf(stderr, "  Ctrl+Shift+Left/Right  - Switch workspace\n");
-    fprintf(stderr, "  Ctrl+Shift+Z           - Command box\n");
-    fprintf(stderr, "  Ctrl+Shift+X           - Cycle focus\n");
-    fprintf(stderr, "  Ctrl+Shift+Down        - Exit\n");
+    fprintf(stderr, "  Ctrl+Shift+Left/Right - Switch WS\n");
+    fprintf(stderr, "  Ctrl+Shift+Z          - Command box\n");
+    fprintf(stderr, "  Ctrl+Shift+X          - Cycle focus\n");
+    fprintf(stderr, "  Ctrl+Shift+Down       - Exit\n");
     fprintf(stderr, "\n");
     
     s->running = true;
     wl_display_run(s->display);
     
     wl_display_destroy(s->display);
-    fprintf(stderr, "\nElDinWM: Clean exit\n");
+    fprintf(stderr, "\nElDinWM: Exit\n");
     return 0;
 }
