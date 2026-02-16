@@ -1,6 +1,5 @@
 /*
- * ElDinWM - Complete Implementation
- * All features: tiling, workspaces, command box, focus cycling, config
+ * ElDinWM - Working Implementation
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -37,25 +36,21 @@
 #define VIEWS_PER_WS 2
 #define MAX_CMD_LEN 512
 
-/* Configuration */
 struct config {
     int num_workspaces;
     char background_image[512];
 };
 
-/* Forward declarations */
 struct server;
 struct output;
 struct view;
 
-/* Command box state */
 struct cmdbox {
     bool active;
     char text[MAX_CMD_LEN];
     int len;
 };
 
-/* Server */
 struct server {
     struct wl_display *display;
     struct wlr_backend *backend;
@@ -89,7 +84,6 @@ struct server {
     bool running;
 };
 
-/* Output */
 struct output {
     struct wl_list link;
     struct server *server;
@@ -100,10 +94,8 @@ struct output {
     
     int current_ws;
     struct wl_list workspaces[MAX_WORKSPACES];
-    struct timespec ws_switch_time;
 };
 
-/* View */
 struct view {
     struct wl_list link;
     struct wl_list ws_link;
@@ -121,18 +113,17 @@ struct view {
     bool mapped;
 };
 
-/* Keyboard */
 struct keyboard {
     struct wl_list link;
     struct server *server;
     struct wlr_keyboard *wlr_keyboard;
     struct wl_listener modifiers;
     struct wl_listener key;
+    struct wl_listener destroy;
 };
 
 static struct server g_server = {0};
 
-/* Utility functions */
 static int count_workspace_views(struct output *output, int ws) {
     int count = 0;
     struct view *v;
@@ -148,7 +139,7 @@ static void layout_workspace(struct output *output) {
     int width = output->wlr_output->width;
     int height = output->wlr_output->height;
     
-    /* Hide all views */
+    /* Hide all views first */
     struct view *view;
     wl_list_for_each(view, &output->server->views, link) {
         if (view->mapped) {
@@ -156,25 +147,26 @@ static void layout_workspace(struct output *output) {
         }
     }
     
-    /* Show current workspace views */
+    /* Count and collect current workspace views */
     int count = 0;
     struct view *views[2] = {NULL, NULL};
     wl_list_for_each(view, &output->workspaces[output->current_ws], ws_link) {
-        if (count < 2) views[count++] = view;
+        if (count < 2 && view->mapped) {
+            views[count++] = view;
+        }
     }
     
-    if (count == 1 && views[0]->mapped) {
+    /* Layout based on count */
+    if (count == 1) {
         wlr_scene_node_set_enabled(&views[0]->scene_tree->node, true);
         wlr_scene_node_set_position(&views[0]->scene_tree->node, 0, 0);
         wlr_xdg_toplevel_set_size(views[0]->xdg_toplevel, width, height);
     } else if (count == 2) {
         int half = width / 2;
         for (int i = 0; i < 2; i++) {
-            if (views[i]->mapped) {
-                wlr_scene_node_set_enabled(&views[i]->scene_tree->node, true);
-                wlr_scene_node_set_position(&views[i]->scene_tree->node, i * half, 0);
-                wlr_xdg_toplevel_set_size(views[i]->xdg_toplevel, half, height);
-            }
+            wlr_scene_node_set_enabled(&views[i]->scene_tree->node, true);
+            wlr_scene_node_set_position(&views[i]->scene_tree->node, i * half, 0);
+            wlr_xdg_toplevel_set_size(views[i]->xdg_toplevel, half, height);
         }
     }
 }
@@ -192,7 +184,6 @@ static struct output *find_space(struct server *server, int *out_ws) {
     return NULL;
 }
 
-/* Execute command */
 static void exec_command(const char *cmd) {
     if (fork() == 0) {
         setsid();
@@ -201,33 +192,22 @@ static void exec_command(const char *cmd) {
     }
 }
 
-/* Focus cycling */
 static void cycle_focus(struct server *server) {
     struct output *output;
     wl_list_for_each(output, &server->outputs, link) {
-        struct workspace {
-            struct view *views[2];
-            int count;
-        } ws = {{NULL, NULL}, 0};
+        struct view *views[2] = {NULL, NULL};
+        int count = 0;
         
         struct view *v;
         wl_list_for_each(v, &output->workspaces[output->current_ws], ws_link) {
-            if (ws.count < 2 && v->mapped) {
-                ws.views[ws.count++] = v;
+            if (count < 2 && v->mapped) {
+                views[count++] = v;
             }
         }
         
-        if (ws.count == 2) {
+        if (count == 2) {
             struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
-            struct view *other = NULL;
-            
-            if (ws.views[0]->xdg_toplevel->base->surface == focused) {
-                other = ws.views[1];
-            } else if (ws.views[1]->xdg_toplevel->base->surface == focused) {
-                other = ws.views[0];
-            } else {
-                other = ws.views[0];
-            }
+            struct view *other = (views[0]->xdg_toplevel->base->surface == focused) ? views[1] : views[0];
             
             if (other && other->mapped) {
                 wlr_seat_keyboard_notify_enter(server->seat,
@@ -238,20 +218,19 @@ static void cycle_focus(struct server *server) {
     }
 }
 
-/* Keyboard handling */
 static void handle_key(struct server *server, xkb_keysym_t sym, uint32_t mods) {
     uint32_t ctrl_shift = WLR_MODIFIER_CTRL | WLR_MODIFIER_SHIFT;
     
-    /* Command box handling */
+    /* Command box mode */
     if (server->cmdbox.active) {
         if (sym == XKB_KEY_Escape) {
             server->cmdbox.active = false;
             server->cmdbox.len = 0;
             server->cmdbox.text[0] = '\0';
-            fprintf(stderr, "Command box closed\n");
-        } else if (sym == XKB_KEY_Return) {
+            fprintf(stderr, "[CMDBOX] Closed\n");
+        } else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
             if (server->cmdbox.len > 0) {
-                fprintf(stderr, "Executing: %s\n", server->cmdbox.text);
+                fprintf(stderr, "[CMDBOX] Executing: %s\n", server->cmdbox.text);
                 exec_command(server->cmdbox.text);
             }
             server->cmdbox.active = false;
@@ -261,23 +240,24 @@ static void handle_key(struct server *server, xkb_keysym_t sym, uint32_t mods) {
             if (server->cmdbox.len > 0) {
                 server->cmdbox.len--;
                 server->cmdbox.text[server->cmdbox.len] = '\0';
-                fprintf(stderr, "Command: %s\n", server->cmdbox.text);
+                fprintf(stderr, "[CMDBOX] %s\n", server->cmdbox.text);
             }
         } else if (sym >= 32 && sym < 127 && server->cmdbox.len < MAX_CMD_LEN - 1) {
             server->cmdbox.text[server->cmdbox.len++] = (char)sym;
             server->cmdbox.text[server->cmdbox.len] = '\0';
-            fprintf(stderr, "Command: %s\n", server->cmdbox.text);
+            fprintf(stderr, "[CMDBOX] %s\n", server->cmdbox.text);
         }
         return;
     }
     
-    /* Global shortcuts */
+    /* Global shortcuts need Ctrl+Shift */
     if (mods != ctrl_shift) return;
     
     switch (sym) {
         case XKB_KEY_Down:
-            fprintf(stderr, "Exiting ElDinWM\n");
+            fprintf(stderr, "[EXIT] Ctrl+Shift+Down pressed - Exiting\n");
             wl_display_terminate(server->display);
+            server->running = false;
             break;
             
         case XKB_KEY_Left:
@@ -287,11 +267,10 @@ static void handle_key(struct server *server, xkb_keysym_t sym, uint32_t mods) {
             wl_list_for_each(output, &server->outputs, link) {
                 int new_ws = output->current_ws + delta;
                 if (new_ws >= 0 && new_ws < server->config.num_workspaces) {
+                    fprintf(stderr, "[WORKSPACE] Switching: %d -> %d\n", 
+                        output->current_ws + 1, new_ws + 1);
                     output->current_ws = new_ws;
-                    clock_gettime(CLOCK_MONOTONIC, &output->ws_switch_time);
                     layout_workspace(output);
-                    fprintf(stderr, "Workspace: %d/%d\n", new_ws + 1, 
-                        server->config.num_workspaces);
                 }
             }
             break;
@@ -302,11 +281,12 @@ static void handle_key(struct server *server, xkb_keysym_t sym, uint32_t mods) {
             server->cmdbox.active = true;
             server->cmdbox.len = 0;
             server->cmdbox.text[0] = '\0';
-            fprintf(stderr, "Command box opened (type command, Enter to run, Esc to cancel)\n");
+            fprintf(stderr, "[CMDBOX] Opened - Type command and press Enter\n");
             break;
             
         case XKB_KEY_x:
         case XKB_KEY_X:
+            fprintf(stderr, "[FOCUS] Cycling focus\n");
             cycle_focus(server);
             break;
     }
@@ -321,21 +301,34 @@ static void kb_modifiers(struct wl_listener *listener, void *data) {
 static void kb_key(struct wl_listener *listener, void *data) {
     struct keyboard *kb = wl_container_of(listener, kb, key);
     struct wlr_keyboard_key_event *event = data;
+    struct server *server = kb->server;
     
+    /* Debug: log all key presses */
     if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        fprintf(stderr, "[KEY] Pressed: keycode=%d\n", event->keycode);
+        
         const xkb_keysym_t *syms;
         int nsyms = xkb_state_key_get_syms(kb->wlr_keyboard->xkb_state, 
             event->keycode + 8, &syms);
         uint32_t mods = wlr_keyboard_get_modifiers(kb->wlr_keyboard);
         
         for (int i = 0; i < nsyms; i++) {
-            handle_key(kb->server, syms[i], mods);
+            handle_key(server, syms[i], mods);
         }
     }
     
-    wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
-    wlr_seat_keyboard_notify_key(kb->server->seat, event->time_msec,
+    wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
+    wlr_seat_keyboard_notify_key(server->seat, event->time_msec,
         event->keycode, event->state);
+}
+
+static void kb_destroy(struct wl_listener *listener, void *data) {
+    struct keyboard *kb = wl_container_of(listener, kb, destroy);
+    wl_list_remove(&kb->modifiers.link);
+    wl_list_remove(&kb->key.link);
+    wl_list_remove(&kb->destroy.link);
+    wl_list_remove(&kb->link);
+    free(kb);
 }
 
 static void new_keyboard(struct server *server, struct wlr_input_device *device) {
@@ -355,12 +348,15 @@ static void new_keyboard(struct server *server, struct wlr_input_device *device)
     wl_signal_add(&wlr_kb->events.modifiers, &kb->modifiers);
     kb->key.notify = kb_key;
     wl_signal_add(&wlr_kb->events.key, &kb->key);
+    kb->destroy.notify = kb_destroy;
+    wl_signal_add(&device->events.destroy, &kb->destroy);
     
     wlr_seat_set_keyboard(server->seat, wlr_kb);
     wl_list_insert(&server->keyboards, &kb->link);
+    
+    fprintf(stderr, "[INPUT] Keyboard added\n");
 }
 
-/* Cursor handling */
 static void process_cursor_motion(struct server *server, uint32_t time) {
     wlr_seat_pointer_notify_motion(server->seat, time,
         server->cursor->x, server->cursor->y);
@@ -417,6 +413,7 @@ static void request_set_selection(struct wl_listener *listener, void *data) {
 
 static void new_pointer(struct server *server, struct wlr_input_device *device) {
     wlr_cursor_attach_input_device(server->cursor, device);
+    fprintf(stderr, "[INPUT] Pointer added\n");
 }
 
 static void new_input(struct wl_listener *listener, void *data) {
@@ -438,7 +435,6 @@ static void new_input(struct wl_listener *listener, void *data) {
     wlr_seat_set_capabilities(server->seat, caps);
 }
 
-/* View handlers */
 static void view_map(struct wl_listener *listener, void *data) {
     struct view *view = wl_container_of(listener, view, map);
     view->mapped = true;
@@ -455,12 +451,11 @@ static void view_map(struct wl_listener *listener, void *data) {
         wlr_seat_keyboard_notify_enter(view->server->seat,
             view->xdg_toplevel->base->surface, NULL, 0, NULL);
         
-        fprintf(stderr, "View mapped: workspace %d/%d (%d views)\n", 
-            ws + 1, view->server->config.num_workspaces, 
-            count_workspace_views(output, ws));
+        fprintf(stderr, "[VIEW] Mapped to workspace %d (now %d views)\n", 
+            ws + 1, count_workspace_views(output, ws));
     } else {
         wlr_scene_node_set_enabled(&view->scene_tree->node, false);
-        fprintf(stderr, "ElDinWM: All workspaces full (max 2 windows per workspace)\n");
+        fprintf(stderr, "[VIEW] Cannot map - all workspaces full!\n");
     }
 }
 
@@ -472,7 +467,7 @@ static void view_unmap(struct wl_listener *listener, void *data) {
         wl_list_remove(&view->ws_link);
         layout_workspace(view->output);
         view->output = NULL;
-        fprintf(stderr, "View unmapped\n");
+        fprintf(stderr, "[VIEW] Unmapped\n");
     }
 }
 
@@ -515,7 +510,6 @@ static void new_xdg_surface(struct wl_listener *listener, void *data) {
     wl_list_insert(&server->views, &view->link);
 }
 
-/* Output handlers */
 static void output_frame(struct wl_listener *listener, void *data) {
     struct output *output = wl_container_of(listener, output, frame);
     struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
@@ -570,11 +564,10 @@ static void new_output(struct wl_listener *listener, void *data) {
     output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
     
     wl_list_insert(&server->outputs, &output->link);
-    fprintf(stderr, "Output: %s (%dx%d)\n", wlr_output->name,
+    fprintf(stderr, "[OUTPUT] %s (%dx%d)\n", wlr_output->name,
         wlr_output->width, wlr_output->height);
 }
 
-/* Config parsing */
 static void get_config_path(char *path, size_t size) {
     const char *xdg = getenv("XDG_CONFIG_HOME");
     if (xdg) {
@@ -608,10 +601,7 @@ static void parse_config(struct config *cfg, const char *path) {
     cfg->background_image[0] = '\0';
     
     FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "Config: using defaults (4 workspaces)\n");
-        return;
-    }
+    if (!f) return;
     
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
@@ -637,19 +627,17 @@ static void parse_config(struct config *cfg, const char *path) {
         
         if (strcmp(key, "workspaces") == 0) {
             int ws = atoi(val);
-            if (ws >= 1 && ws <= MAX_WORKSPACES) {
-                cfg->num_workspaces = ws;
-            }
+            if (ws >= 1 && ws <= MAX_WORKSPACES) cfg->num_workspaces = ws;
         } else if (strcmp(key, "background_image") == 0) {
             strncpy(cfg->background_image, val, sizeof(cfg->background_image) - 1);
         }
     }
     
     fclose(f);
-    fprintf(stderr, "Config: %d workspaces\n", cfg->num_workspaces);
 }
 
 static void handle_signal(int sig) {
+    fprintf(stderr, "\n[SIGNAL] Received signal %d - terminating\n", sig);
     wl_display_terminate(g_server.display);
 }
 
@@ -665,7 +653,6 @@ int main(void) {
     signal(SIGTERM, handle_signal);
     signal(SIGCHLD, SIG_IGN);
     
-    /* Load config */
     char cfg_path[512];
     get_config_path(cfg_path, sizeof(cfg_path));
     parse_config(&s->config, cfg_path);
@@ -683,15 +670,16 @@ int main(void) {
     s->scene = wlr_scene_create();
     s->scene_layout = wlr_scene_attach_output_layout(s->scene, s->output_layout);
     
-    /* Background (dark blue) */
+    /* Background at the bottom layer */
+    struct wlr_scene_tree *bg_tree = wlr_scene_tree_create(&s->scene->tree);
+    wlr_scene_node_lower_to_bottom(&bg_tree->node);
     float bg[4] = {0.0, 0.05, 0.15, 1.0};
-    wlr_scene_rect_create(&s->scene->tree, 8192, 8192, bg);
+    wlr_scene_rect_create(bg_tree, 8192, 8192, bg);
     
     s->xdg_shell = wlr_xdg_shell_create(s->display, 3);
     s->new_xdg_surface.notify = new_xdg_surface;
     wl_signal_add(&s->xdg_shell->events.new_surface, &s->new_xdg_surface);
     
-    /* Cursor */
     s->cursor = wlr_cursor_create();
     wlr_cursor_attach_output_layout(s->cursor, s->output_layout);
     s->cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
@@ -727,23 +715,28 @@ int main(void) {
     
     setenv("WAYLAND_DISPLAY", socket, 1);
     
-    fprintf(stderr, "\n╔══════════════════════════════════════╗\n");
-    fprintf(stderr, "║         ElDinWM Started              ║\n");
-    fprintf(stderr, "╚══════════════════════════════════════╝\n\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "╔════════════════════════════════════════╗\n");
+    fprintf(stderr, "║       ElDinWM - Ready                  ║\n");
+    fprintf(stderr, "╚════════════════════════════════════════╝\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "WAYLAND_DISPLAY=%s\n", socket);
     fprintf(stderr, "Workspaces: %d\n", s->config.num_workspaces);
-    fprintf(stderr, "Max windows per workspace: 2\n");
-    fprintf(stderr, "\nKeybindings:\n");
-    fprintf(stderr, "  Ctrl+Shift+Left/Right  - Switch workspace\n");
-    fprintf(stderr, "  Ctrl+Shift+Z           - Open command box\n");
-    fprintf(stderr, "  Ctrl+Shift+X           - Cycle focus (2 windows)\n");
-    fprintf(stderr, "  Ctrl+Shift+Down        - Exit\n");
-    fprintf(stderr, "\nConfig: %s\n\n", cfg_path);
+    fprintf(stderr, "Config: %s\n", cfg_path);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "KEYBINDINGS:\n");
+    fprintf(stderr, "  Ctrl+Shift+Left/Right - Switch workspace\n");
+    fprintf(stderr, "  Ctrl+Shift+Z          - Command box\n");
+    fprintf(stderr, "  Ctrl+Shift+X          - Cycle focus\n");
+    fprintf(stderr, "  Ctrl+Shift+Down       - EXIT\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Watching keyboard events...\n");
+    fprintf(stderr, "\n");
     
     s->running = true;
     wl_display_run(s->display);
     
     wl_display_destroy(s->display);
-    fprintf(stderr, "\nElDinWM: Clean exit\n");
+    fprintf(stderr, "\nElDinWM: Clean shutdown\n");
     return 0;
 }
